@@ -70,7 +70,19 @@ Xem `harness/middleware.py` để biết thứ tự các hook.
 
 from __future__ import annotations
 
+from harness.layers._evidence import Evidence, clip, norm, note_retrieval
 from harness.middleware import Middleware
+
+#: = `arena.scorer.MAX_CLAIMS_PER_DOC` / `MAX_SCORED_CLAIMS`: claim vượt
+#: trần bị chấm `REDUNDANT` / `EXCESS` (phạt 1.0) — xoá đi còn hơn.
+MAX_CLAIMS_PER_DOC = 4
+MAX_CLAIMS = 10
+
+NO_EVIDENCE_ANSWER = (
+    "Không đủ căn cứ: không câu nào trong câu trả lời khớp nguyên văn với tài "
+    "liệu đã đọc, nên không thể đưa ra số liệu hay kết luận."
+)
+CONFLICT_NOTE = "Các nguồn mâu thuẫn nhau, không đủ căn cứ để chọn một bên. "
 
 
 class Critic(Middleware):
@@ -78,17 +90,56 @@ class Critic(Middleware):
 
     name = "critic"
 
+    def wrap_tool_call(self, ctx, call, name, args):
+        # Chỉ ghi lại tài liệu đã truy xuất — "bằng chứng" mà after_agent xét.
+        before = ctx.tools.calls
+        result = call(name, args)
+        note_retrieval(ctx, name, args, result, before)
+        return result
+
     def after_agent(self, ctx, report):
-        # TODO (§2): khoảng 10-25 dòng.
-        #  1. Lấy report["claims"]; nếu rỗng hoặc không phải list thì thôi.
-        #  2. Với mỗi claim: nếu claim["text"] có trong ctx.observed_text
-        #     -> giữ nguyên (KHÔNG sửa chữ).
-        #  3. Nếu không: thử tách câu ghép (trường hợp (c) ở docstring).
-        #     Tách được -> giữ cả hai nửa, mỗi nửa gắn doc_id của tài liệu
-        #     thật sự chứa nó, và đặt report["abstain"] = True.
-        #  4. Không tách được -> đây là bịa: bỏ claim đi.
-        #  5. Nếu không còn claim nào: report["abstain"] = True,
-        #     claims = [], citations = [], và viết lại "answer" nói rõ là
-        #     không đủ căn cứ.
-        #  6. Cập nhật report["citations"] cho khớp với claims còn lại.
-        return report  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        claims = report.get("claims")
+        if not isinstance(claims, list) or not claims:
+            return report
+        evidence = Evidence(ctx)
+        kept, spliced = [], False
+        for claim in claims:
+            text = claim.get("text") if isinstance(claim, dict) else None
+            if not isinstance(text, str):
+                continue  # MALFORMED: bỏ
+            if evidence.source_of(text) is not None:
+                kept.append(claim if clip(text) == text else {**claim, "text": clip(text)})
+                continue
+            # Không dòng nào chứa nguyên câu: tìm các đoạn con trích được
+            # (câu ghép hai nguồn, câu thêm dấu chấm...). Không có -> bịa, bỏ.
+            pieces = [
+                {"text": piece, "doc_id": evidence.source_of(piece, claim.get("doc_id"))}
+                for piece in evidence.pieces(text)
+            ]
+            kept.extend(pieces)
+            # Hai đoạn từ HAI tài liệu khác nhau = mô hình ghép hai nguồn
+            # mâu thuẫn thành một câu không tài liệu nào nói.
+            spliced = spliced or len({piece["doc_id"] for piece in pieces}) > 1
+
+        # Bỏ claim trùng chữ (cùng một câu gắn hai tài liệu không thêm dữ
+        # kiện nào, chỉ ăn vào hạn mức claim thừa) và claim vượt trần.
+        claims, seen, per_doc = [], set(), {}
+        for claim in kept:
+            doc_id = claim.get("doc_id") if isinstance(claim.get("doc_id"), str) else ""
+            key = norm(claim["text"])
+            if key in seen or per_doc.get(doc_id, 0) >= MAX_CLAIMS_PER_DOC or len(claims) >= MAX_CLAIMS:
+                continue
+            seen.add(key)
+            per_doc[doc_id] = per_doc.get(doc_id, 0) + 1
+            claims.append(claim)
+
+        report["claims"] = claims
+        report["citations"] = sorted(doc_id for doc_id in per_doc if doc_id)
+        if not claims:
+            report["abstain"] = True
+            report["answer"] = NO_EVIDENCE_ANSWER
+        elif spliced:
+            report["abstain"] = True
+            answer = report.get("answer")
+            report["answer"] = CONFLICT_NOTE + (answer if isinstance(answer, str) else "")
+        return report

@@ -47,12 +47,28 @@ nên lớp cần "chốt hạ" cuối cùng phải đứng đầu tiên.
 
 from __future__ import annotations
 
+from arena.corpus import INJECTION_CANARY
+from arena.tools import ToolResult
+
 from harness.middleware import Middleware
 
 #: Dấu mốc của đoạn nội dung không đáng tin trong kho tài liệu.
 BLOCK_START = "--- LƯU Ý HỆ THỐNG"
 BLOCK_END = "--- HẾT LƯU Ý HỆ THỐNG ---"
 PLACEHOLDER = "[nội dung không đáng tin cậy đã bị loại bỏ]"
+
+
+def _quarantine(content: str) -> str:
+    """Thay mọi đoạn độc bằng PLACEHOLDER; gỡ cả canary lọt ngoài dấu mốc."""
+    while BLOCK_START in content:
+        start = content.find(BLOCK_START)
+        end = content.find(BLOCK_END, start)
+        if end == -1:
+            # Fetch bị cắt giữa chừng: có dấu mở mà không có dấu đóng.
+            content = content[:start] + PLACEHOLDER
+            break
+        content = content[:start] + PLACEHOLDER + content[end + len(BLOCK_END):]
+    return content.replace(INJECTION_CANARY, PLACEHOLDER)
 
 
 class InjectionGuard(Middleware):
@@ -62,17 +78,22 @@ class InjectionGuard(Middleware):
 
     def wrap_tool_call(self, ctx, call, name, args):
         result = call(name, args)
-        # TODO (§10): khoảng 8-15 dòng.
-        #  1. Nếu BLOCK_START không có trong result.content -> trả về result.
-        #  2. Cắt từ BLOCK_START tới hết BLOCK_END, thay bằng PLACEHOLDER.
-        #     Nếu KHÔNG tìm thấy BLOCK_END (fetch bị cắt giữa chừng) thì
-        #     cắt từ BLOCK_START tới hết chuỗi.
-        #  3. Lặp lại cho tới khi không còn BLOCK_START nào.
-        #  4. Trả về ToolResult(ok=result.ok, content=<đã sạch>, error=result.error).
-        return result  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        content = result.content if isinstance(result.content, str) else ""
+        if BLOCK_START not in content and INJECTION_CANARY not in content:
+            return result
+        ctx.state["injection_blocks_removed"] = ctx.state.get("injection_blocks_removed", 0) + 1
+        return ToolResult(ok=result.ok, content=_quarantine(content), error=result.error)
 
     def after_agent(self, ctx, report):
-        # TODO (§10): 2-4 dòng.
-        #  Nếu INJECTION_CANARY còn trong report["answer"] thì gỡ nó ra.
-        #  Chỉ sửa "answer" — tuyệt đối không sửa text của claim.
-        return report  # <- mặc định KHÔNG LÀM GÌ
+        # Viết lại `answer` (và mọi trường chữ khác) là miễn phí. Claim thì
+        # KHÔNG được sửa chữ — claim nào mang canary thì xoá hẳn.
+        for key, value in list(report.items()):
+            if isinstance(value, str) and INJECTION_CANARY in value:
+                report[key] = value.replace(INJECTION_CANARY, "").strip()
+        claims = report.get("claims")
+        if isinstance(claims, list):
+            report["claims"] = [c for c in claims if INJECTION_CANARY not in str(c)]
+        citations = report.get("citations")
+        if isinstance(citations, list):
+            report["citations"] = [c for c in citations if INJECTION_CANARY not in str(c)]
+        return report
